@@ -1,130 +1,109 @@
+from datetime import datetime, timedelta, timezone
+from unittest import mock
+
 import pytest
-from airflow.exceptions import AirflowSkipException
+from airflow.exceptions import AirflowFailException
+from airflow.utils.trigger_rule import TriggerRule
 
-from common.constants import PRODUCTION
-from elasticsearch_cluster.healthcheck_dag import compose_notification
-
-
-_TEST_ENV = "testing_environment"
-
-
-def _make_response_body(**kwargs):
-    # Default values based on real response from Openverse staging cluster
-    # Only the `cluster_name` is changed to reflect the environment
-    return {
-        "cluster_name": "testcluster",
-        "status": "green",
-        "timed_out": False,
-        "number_of_nodes": 6,
-        "number_of_data_nodes": 3,
-        "active_primary_shards": 51,
-        "active_shards": 103,
-        "relocating_shards": 0,
-        "initializing_shards": 0,
-        "unassigned_shards": 0,
-        "delayed_unassigned_shards": 0,
-        "number_of_pending_tasks": 0,
-        "number_of_in_flight_fetch": 0,
-        "task_max_waiting_in_queue_millis": 0,
-        "active_shards_percent_as_number": 100,
-    } | kwargs
-
-
-def _missing_node_keys(master_nodes: int, data_nodes: int):
-    total_nodes = master_nodes + data_nodes
-    return (
-        f"Elasticsearch {_TEST_ENV} cluster node count is *{total_nodes}*",
-        "Expected 6 total nodes.",
-        f"Master nodes: *{master_nodes}* of expected 3",
-        f"Data nodes: *{data_nodes}* of expected 3",
-    )
-
-
-@pytest.mark.parametrize(
-    ("expected_message_type", "message_keys", "cluster_health_response"),
-    (
-        pytest.param(
-            "alert",
-            (f"Elasticsearch {_TEST_ENV} cluster status is *red*",),
-            _make_response_body(status="red"),
-            id="red-status",
-        ),
-        pytest.param(
-            "alert",
-            _missing_node_keys(master_nodes=3, data_nodes=2),
-            _make_response_body(
-                status="yellow",
-                number_of_nodes=5,
-                number_of_data_nodes=2,
-            ),
-            id="missing-data-node",
-        ),
-        pytest.param(
-            "alert",
-            _missing_node_keys(master_nodes=2, data_nodes=3),
-            _make_response_body(
-                status="yellow",
-                number_of_nodes=5,
-                number_of_data_nodes=3,
-            ),
-            id="missing-master-node",
-        ),
-        pytest.param(
-            "alert",
-            _missing_node_keys(master_nodes=1, data_nodes=2),
-            _make_response_body(
-                status="yellow",
-                number_of_nodes=3,
-                number_of_data_nodes=2,
-            ),
-            id="missing-some-of-both-node-types",
-        ),
-        pytest.param(
-            "notification",
-            (f"Elasticsearch {_TEST_ENV} cluster health is *yellow*.",),
-            _make_response_body(
-                status="yellow",
-            ),
-            id="yellow-status-all-nodes-present",
-        ),
-        pytest.param(
-            None,
-            None,
-            _make_response_body(status="green"),
-            id="green-status",
-            marks=pytest.mark.raises(exception=AirflowSkipException),
-        ),
-    ),
+from catalog.dags.elasticsearch_cluster.healthcheck_dag import (
+    _clear_alarm_variable,
+    _check_if_throttled,
+    _set_alarm_variable,
+    ALERT_THROTTLE_WINDOW,
+    create_es_health_check_dag,
+    ELASTICSEARCH_HEALTH_IN_ALARM_VAR,
 )
-def test_compose_notification(
-    expected_message_type, message_keys, cluster_health_response
-):
-    message_type, message = compose_notification.function(
-        _TEST_ENV, cluster_health_response, is_data_refresh_running=False
+
+
+DAG = create_es_health_check_dag("test")
+
+
+def test_dag_structure():
+    """
+    Test the DAG structure and dependencies to ensure tasks are wired correctly.
+    """
+    assert DAG.dag_id == "test_elasticsearch_health_check"
+    health_check = DAG.get_task("check_es_health")
+    clear_alarm = DAG.get_task("clear_alarm_variable")
+    check_throttle = DAG.get_task("check_if_throttled")
+    notify_failure = DAG.get_task("notify_failure")
+    set_alarm = DAG.get_task("set_alarm_variable")
+
+    # Check success path
+    assert health_check.downstream_task_ids == {"clear_alarm_variable", "check_if_throttled"}
+    assert clear_alarm.upstream_task_ids == {"check_es_health"}
+    assert clear_alarm.trigger_rule == TriggerRule.ALL_SUCCESS
+
+    # Check failure path
+    assert check_throttle.upstream_task_ids == {"check_es_health"}
+    assert check_throttle.trigger_rule == TriggerRule.ALL_FAILED
+    assert notify_failure.upstream_task_ids == {"check_if_throttled"}
+    assert set_alarm.upstream_task_ids == {"notify_failure"}
+
+
+@mock.patch("catalog.dags.elasticsearch_cluster.healthcheck_dag.ElasticsearchPythonHook")
+def test_check_es_health_green(mock_es_hook):
+    """Test that the health check passes with green status."""
+    mock_es_hook.return_value.get_conn.return_value.cluster.health.return_value = {
+        "status": "green"
+    }
+    health_check_task = DAG.get_task("check_es_health")
+    health_check_task.execute(context={})
+
+
+@mock.patch("catalog.dags.elasticsearch_cluster.healthcheck_dag.ElasticsearchPythonHook")
+def test_check_es_health_red_fails(mock_es_hook):
+    """Test that the health check fails as expected with red status."""
+    mock_es_hook.return_value.get_conn.return_value.cluster.health.return_value = {
+        "status": "red"
+    }
+    health_check_task = DAG.get_task("check_es_health")
+    with pytest.raises(AirflowFailException):
+        health_check_task.execute(context={})
+
+
+@mock.patch("airflow.models.Variable.get")
+def test_check_if_throttled_no_variable(mock_variable_get):
+    """Test that throttling is off when no variable is set (first failure)."""
+    mock_variable_get.return_value = None
+    assert _check_if_throttled() is True
+    mock_variable_get.assert_called_once_with(
+        ELASTICSEARCH_HEALTH_IN_ALARM_VAR, default_var=None
     )
 
-    assert message_type == expected_message_type
-    for message_key in message_keys:
-        assert message_key in message
+
+@mock.patch("airflow.models.Variable.get")
+def test_check_if_throttled_within_window(mock_variable_get):
+    """Test that throttling is on when the last alert was recent."""
+    now = datetime.now(timezone.utc)
+    last_alert_time = (now - timedelta(hours=1)).isoformat()
+    mock_variable_get.return_value = last_alert_time
+    assert _check_if_throttled() is False
 
 
-def test_production_compose_notification_data_refresh_running():
-    with pytest.raises(AirflowSkipException):
-        cluster_health_response = _make_response_body(status="yellow")
-        compose_notification.function(
-            PRODUCTION,
-            cluster_health_response,
-            is_data_refresh_running=True,
-        )
+@mock.patch("airflow.models.Variable.get")
+def test_check_if_throttled_outside_window(mock_variable_get):
+    """Test that throttling is off when the last alert was a long time ago."""
+    old_alert_time = (
+        datetime.now(timezone.utc) - ALERT_THROTTLE_WINDOW - timedelta(minutes=1)
+    ).isoformat()
+    mock_variable_get.return_value = old_alert_time
+    assert _check_if_throttled() is True
 
 
-def test_production_compose_notification_data_refresh_not_running():
-    cluster_health_response = _make_response_body(status="yellow")
-    message_type, message = compose_notification.function(
-        PRODUCTION,
-        cluster_health_response,
-        is_data_refresh_running=False,
-    )
+@mock.patch("airflow.models.Variable.set")
+def test_set_alarm_variable(mock_variable_set):
+    """Test that the alarm variable is set correctly."""
+    _set_alarm_variable()
+    mock_variable_set.assert_called_once()
+    # Basic check to ensure it's called with the variable name and an ISO timestamp string
+    args, _ = mock_variable_set.call_args
+    assert args[0] == ELASTICSEARCH_HEALTH_IN_ALARM_VAR
+    assert isinstance(args[1], str)
 
-    assert message_type == "notification"
-    assert "Elasticsearch production cluster health is *yellow*." in message
+
+@mock.patch("airflow.models.Variable.delete")
+def test_clear_alarm_variable(mock_variable_delete):
+    """Test that the alarm variable is deleted correctly."""
+    _clear_alarm_variable()
+    mock_variable_delete.assert_called_once_with(ELASTICSEARCH_HEALTH_IN_ALARM_VAR)
